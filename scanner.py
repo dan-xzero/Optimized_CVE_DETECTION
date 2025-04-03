@@ -492,7 +492,7 @@ def fetch_all_repositories():
         all_repos.extend(data.get("values", []))
         url = data.get("next")
     print(f"[Fetch] Total repositories fetched: {len(all_repos)}")  # 🔍 Debug line
-    return [{"name": r["name"], "clone_url": r["links"]["clone"][0]["href"]} for r in all_repos][:5]
+    return [{"name": r["name"], "clone_url": next(link["href"] for link in r["links"]["clone"] if link["name"] == "ssh")} for r in all_repos][:5]
 
 def process_single_repository(repo, rescan_mode=False):
     repo_name = repo.get("name")
