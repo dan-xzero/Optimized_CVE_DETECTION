@@ -1,0 +1,29 @@
+# Bytecode
+__pycache__/
+*.py[cod]
+
+# Logs & runtime
+logs/
+*.log
+openai_logs.txt
+
+# Environment secrets
+.env
+
+# Output files
+repo_vuln.db
+aggregated_vulnerabilities.json
+
+# SBOMs and feed data
+sboms/
+nvdcve_feed/
+repos/
+
+# Node & React (if re-enabled later)
+frontend/build/
+frontend/node_modules/
+
+# Editor
+.vscode/
+.idea/
+.DS_Store

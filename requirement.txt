@@ -1,0 +1,12 @@
+requests
+slack_sdk
+openai
+python-dotenv
+packaging
+flask
+jinja2
+# For SBOM parsing
+cyclonedx-python-lib
+
+# For SQLite DB viewing
+sqlite-utils
