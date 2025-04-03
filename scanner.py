@@ -137,7 +137,7 @@ def send_slack_message(text):
 
 def send_slack_file(filepath, initial_comment=None):
     command = [
-        "python3.9", "file_upload.py",
+        "python3", "file_upload.py",
         f'--token="{SLACK_API_TOKEN}"',
         f'--file="{filepath}"',
         f'--channels="{SLACK_CHANNEL_ID}"'
@@ -596,7 +596,7 @@ def process_repositories_parallel():
 
         log_file = open(f"logs/{name}.log", "w")
         cmd = [
-            "python3.9", "scan_repo_worker.py",
+            "python3", "scan_repo_worker.py",
             "--repo-name", name,
             "--clone-url", url
         ]
@@ -638,20 +638,57 @@ def process_single_cve(args):
     if not cve_id:
         return None
 
+    # Extract description safely
     desc_list = cve.get("description", {}).get("description_data", [])
-    desc = next((d['value'] for d in desc_list if d['lang'] == 'en'), '')
+    desc = next((d.get('value', '') for d in desc_list if d.get('lang') == 'en'), '')
 
-    # Attempt to extract CVSS
-    cvss_data = item.get("impact", {}).get("baseMetricV3", {})
-    cvss = cvss_data.get("cvssV3", {}).get("baseScore") if cvss_data else None
+    # Extract CVSS and Severity
+    impact = item.get("impact", {}).get("baseMetricV3", {})
+    cvss_data = impact.get("cvssV3", {})
+    severity = cvss_data.get("baseSeverity", "")
+    cvss = cvss_data.get("baseScore")
 
-    # If missing CVSS, fallback to API
-    if not cvss:
+    # Estimate EPSS from Shodan
+    epss_score, epss_pct = query_epss_score(cve_id)
+
+    # Decision: REST enrichment only if severity is HIGH/CRITICAL or EPSS > 0.7
+    if severity not in ["HIGH", "CRITICAL"] and epss_score <= 0.7:
+        enriched = {
+            "predicted_severity": severity,
+            "predicted_score": cvss or 0,
+            "detailed_description": desc,
+            "vulnerable_package": "",
+            "mitigation": "",
+            "explanation": "Skipped REST API due to low severity and EPSS",
+            "epss_score": epss_score,
+            "epss_percentile": epss_pct
+        }
+    else:
+        print(f"[Enrich] Querying REST API for {cve_id} (Severity: {severity}, EPSS: {epss_score})")
         api_data = query_nvd_rest_api(cve_id)
         if api_data:
-            cvss = api_data.get("metrics", {}).get("cvssMetricV31", [{}])[0].get("cvssData", {}).get("baseScore")
+            desc = next(
+                (d.get("value", desc) for d in api_data.get("descriptions", []) if d.get("lang") == "en"),
+                desc
+            )
+            cvss = api_data.get("metrics", {}).get("cvssMetricV31", [{}])[0].get("cvssData", {}).get("baseScore") or cvss
 
-    matches = []
+        enriched = openai_detailed_assessment(cve_id, {
+            "severity": severity,
+            "cvss": cvss or "",
+            "description": desc,
+            "references": []
+        })
+
+    # False positive check
+    false_positive, _ = openai_validate_false_positive(
+        cve_id,
+        enriched.get("detailed_description", ""),
+        enriched.get("vulnerable_package", ""),
+        "unknown"
+    )
+
+    # Match to known repo CPEs
     for node in item.get("configurations", {}).get("nodes", []):
         for match in node.get("cpe_match", []):
             cpe = match.get("cpe23Uri")
@@ -660,20 +697,10 @@ def process_single_cve(args):
             v, p, ver = parse_cpe_string(cpe)
             for repo_id, repo_name, db_v, db_p, db_ver in cpe_records:
                 if db_p and p and db_p.lower() in p.lower():
-                    enriched = openai_detailed_assessment(cve_id, {
-                        "severity": item.get("impact", {}).get("baseMetricV3", {}).get("severity", ""),
-                        "cvss": cvss or "",
-                        "description": desc,
-                        "references": []
-                    })
-                    false_positive, fp_explanation = openai_validate_false_positive(
-                    cve_id,
-                    enriched.get("detailed_description", ""),
-                    enriched.get("vulnerable_package", ""),
-                    "unknown"
-                    )
                     return (repo_name, cve_id, enriched, false_positive)
+
     return None
+
 
 def process_nvd_feeds():
     print("Downloading and processing NVD feeds...")
@@ -731,31 +758,59 @@ def process_nvd_feeds():
     conn.close()
     print("NVD feed processing complete.")
     
+# Shared tracker across calls
+nvd_last_reset = time.time()
+nvd_request_count = 0
+NVD_MAX_REQUESTS = 45
+NVD_WINDOW_SECONDS = 30
+
 def query_nvd_rest_api(cve_id, max_retries=3, delay=2):
+    global nvd_request_count, nvd_last_reset
+
     url = f"{NVD_REST_API_BASE}{urllib.parse.quote(cve_id)}"
     headers = {
-        "apiKey": NVD_API_KEY,
-        "User-Agent": "danxzero_scanner/1.0 "  # Replace this!
+        "ApiKey": NVD_API_KEY,
+        "User-Agent": "danxzero_scanner/1.0"
     }
 
-    for attempt in range(max_retries):
+    for attempt in range(1, max_retries + 1):
+        # Handle fixed rate limiting
+        now = time.time()
+        if now - nvd_last_reset > NVD_WINDOW_SECONDS:
+            nvd_request_count = 0
+            nvd_last_reset = now
+
+        if nvd_request_count >= NVD_MAX_REQUESTS:
+            sleep_time = NVD_WINDOW_SECONDS - (now - nvd_last_reset)
+            print(f"[RATE LIMIT] Hit {NVD_MAX_REQUESTS} reqs. Sleeping {int(sleep_time)}s...")
+            time.sleep(sleep_time)
+            nvd_request_count = 0
+            nvd_last_reset = time.time()
+
         try:
+            print(f"[DEBUG] Attempt {attempt} for {cve_id}")
+            print(f"[DEBUG] URL: {url}")
+            print(f"[DEBUG] Headers: {headers}")
+
             resp = requests.get(url, headers=headers, timeout=15)
-            
+            nvd_request_count += 1
+
+            print(f"[DEBUG] Status = {resp.status_code}")
+
             if resp.status_code == 403:
-                print(f"[NVD] 403 Forbidden for {cve_id} (attempt {attempt+1}) — backing off...")
+                print(f"[DEBUG] 403 Forbidden — API key may be rate-limited.")
                 time.sleep(delay)
-                continue  # retry
-            
+                continue
+
             resp.raise_for_status()
             results = resp.json().get("vulnerabilities", [])
             return results[0].get("cve") if results else None
 
         except Exception as e:
-            print(f"[NVD] Error for {cve_id} (attempt {attempt+1}): {e}")
+            print(f"[NVD ERROR] {cve_id} — {e}")
             time.sleep(delay)
 
-    print(f"[NVD] Failed to retrieve data for {cve_id} after {max_retries} attempts.")
+    print(f"[FAIL] Gave up after {max_retries} attempts for {cve_id}")
     return None
 
 # Continue with: Aggregation, Slack report, and run_main entrypoint
