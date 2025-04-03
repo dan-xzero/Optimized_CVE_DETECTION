@@ -40,14 +40,15 @@ if __name__ == "__main__":
         vulns = aggregate_vulnerabilities()
         related = [v for v in vulns if v["repository"] == args.repo_name and not v["false_positive"]]
 
-        if related:
-            send_slack_message(
-                f"✅ Scan completed for `{args.repo_name}`. Found *{len(related)}* vulnerabilities."
-            )
-        else:
-            send_slack_message(
-                f"✅ Scan completed for `{args.repo_name}`. No new vulnerabilities found. 🎉"
-            )
+        if args.rescan:
+            if related:
+                send_slack_message(
+                    f"✅ Scan completed for `{args.repo_name}`. Found *{len(related)}* vulnerabilities."
+                )
+            else:
+                send_slack_message(
+                    f"✅ Scan completed for `{args.repo_name}`. No new vulnerabilities found. 🎉"
+                )
 
     except Exception as e:
         print(f"[Worker ERROR] {args.repo_name}: {e}")

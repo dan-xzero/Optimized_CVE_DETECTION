@@ -155,7 +155,24 @@ def send_slack_file(filepath, initial_comment=None):
 # SQLite DB Initialization
 
 def connect_db():
-    return sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
+# ---- Retry-safe DB write function ----
+def safe_db_write(cur, query, params, retries=5, delay=1):
+    for attempt in range(retries):
+        try:
+            cur.execute(query, params)
+            return
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e).lower():
+                print(f"[DB Retry] Attempt {attempt+1}: database is locked. Retrying in {delay}s...")
+                time.sleep(delay)
+            else:
+                raise
+    raise RuntimeError("Exceeded max retries for database write.")
 
 def init_db():
     conn = connect_db()
@@ -473,7 +490,7 @@ def save_repository_cpes(repo_name, cpe_list):
         version = entry.get("version")
         if vendor and product and version:
             cpe_str = f"cpe:2.3:a:{vendor}:{product}:{version}:*:*:*:*:*:*:*"
-            cur.execute("""
+            safe_db_write(cur, """
                 INSERT OR IGNORE INTO repository_cpes 
                 (repository_id, cpe, vendor, product, version)
                 VALUES (?, ?, ?, ?, ?)
@@ -524,7 +541,7 @@ def process_single_repository(repo, rescan_mode=False):
         grype_data = run_grype(sbom_path)
 
         # Insert or update repository
-        cur.execute("""
+        safe_db_write(cur, """
             REPLACE INTO repositories (name, clone_url, last_commit)
             VALUES (?, ?, ?)
         """, (repo_name, clone_url, remote_commit))
@@ -555,7 +572,7 @@ def process_single_repository(repo, rescan_mode=False):
                     db_ver
                 )
 
-                cur.execute("""
+                safe_db_write(cur, """
                     INSERT INTO grype_vulnerabilities (
                         repository_name, vulnerability_id, actual_severity,
                         predicted_severity, predicted_score, epss_score, epss_percentile,
@@ -746,7 +763,7 @@ def process_nvd_feeds():
             repo_name, cve_id, enriched, false_positive = result
             cur.execute("SELECT 1 FROM grype_vulnerabilities WHERE repository_name=? AND vulnerability_id=?", (repo_name, cve_id))
             if not cur.fetchone():
-                cur.execute("""
+                safe_db_write(cur, """
     INSERT INTO nvd_vulnerabilities (
         repository_name, vulnerability_id, actual_severity,
         predicted_severity, predicted_score, epss_score, epss_percentile,
@@ -1065,7 +1082,7 @@ def send_critical_vuln_alerts(vulns):
         send_combined_alert(repo_name, vuln_id, severity, score, clone_url)
 
         # Mark as notified
-        cur.execute("""
+        safe_db_write(cur, """
             UPDATE grype_vulnerabilities
             SET notified = 1
             WHERE repository_name = ? AND vulnerability_id = ?
