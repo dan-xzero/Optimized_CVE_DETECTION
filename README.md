@@ -59,7 +59,7 @@ python3 scanner.py
 ```bash
 python3 slack_interactivity_server.py
 ```
-(Expose with `ngrok http 5000` and set URL in Slack app settings)
+(Expose with `ngrok http port` and set URL in Slack app settings)
 
 ---
 
