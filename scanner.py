@@ -983,6 +983,6 @@ def patch_add_notified_columns():
     conn.commit()
     conn.close()
 
-# Main Runner
+## Main Runner
 if __name__ == "__main__":
     run_main()
