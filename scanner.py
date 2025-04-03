@@ -212,16 +212,24 @@ def init_db():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS nvd_vulnerabilities (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        repository_id INTEGER,
-        cve_id TEXT,
-        cpe TEXT,
-        vulnerability_json TEXT,
-        query_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        repository_name TEXT,
+        vulnerability_id TEXT,
+        actual_severity TEXT,
+        predicted_severity TEXT,
+        predicted_score REAL,
+        epss_score REAL,
+        epss_percentile REAL,
+        detailed_description TEXT,
+        vulnerable_package TEXT,
+        mitigation TEXT,
+        explanation TEXT,
+        false_positive BOOLEAN DEFAULT 0,
         notified BOOLEAN DEFAULT 0,
-        UNIQUE(repository_id, cve_id),
-        FOREIGN KEY(repository_id) REFERENCES repositories(id)
+        query_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(repository_name, vulnerability_id)
     )
 """)
+
 
     conn.commit()
     conn.close()
@@ -743,15 +751,15 @@ def process_nvd_feeds():
         repository_name, vulnerability_id, actual_severity,
         predicted_severity, predicted_score, epss_score, epss_percentile,
         detailed_description, vulnerable_package, mitigation, explanation,
-        false_positive
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        false_positive, notified
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """, (
     repo_name, cve_id, "NVD",
     enriched.get("predicted_severity"), enriched.get("predicted_score"),
     enriched.get("epss_score"), enriched.get("epss_percentile"),
     enriched.get("detailed_description"), enriched.get("vulnerable_package"),
     enriched.get("mitigation"), enriched.get("explanation"),
-    false_positive
+    false_positive, 0  # 0 means not notified yet
 ))
 
     conn.commit()
