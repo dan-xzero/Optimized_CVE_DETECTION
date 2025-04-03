@@ -892,10 +892,13 @@ def aggregate_vulnerabilities():
 # scanner.py — (Commented) Jira Ticket Creation Stub
 
 def create_jira_ticket(repo, vuln_id, severity):
+    import json
+    from datetime import datetime
+
     conn = connect_db()
     cur = conn.cursor()
     cur.execute("""
-        SELECT detailed_description, vulnerable_package, mitigation, explanation, predicted_score, epss_score
+        SELECT detailed_description, vulnerable_package, mitigation, explanation, predicted_score
         FROM grype_vulnerabilities
         WHERE repository_name = ? AND vulnerability_id = ?
     """, (repo, vuln_id))
@@ -907,28 +910,68 @@ def create_jira_ticket(repo, vuln_id, severity):
             "text": f"❌ Could not find details for {vuln_id} in {repo}."
         }
 
-    description, pkg, mitigation, explanation, score, epss = row
+    description, pkg, mitigation, explanation, score = row
 
     summary = f"{severity} vulnerability in {repo}: {vuln_id}"
-    jira_description = f"""
-*Repository:* `{repo}`
-*CVE:* `{vuln_id}`
-*Severity:* {severity}
-*Score:* {score}
-*EPSS:* {epss}
-*Affected Package:* {pkg}
 
-*Description:*
-{description}
+    priority = {
+        "CRITICAL": "Critical",
+        "HIGH": "High",
+        "MEDIUM": "Medium",
+        "LOW": "Low"
+    }.get(severity.upper(), "Medium")
 
-*Mitigation Recommendation:*
-{mitigation}
+    jira_description_adf = {
+        "version": 1,
+        "type": "doc",
+        "content": [
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "📁 "},
+                {"type": "text", "text": "Repository: ", "marks": [{"type": "strong"}]},
+                {"type": "text", "text": repo}
+            ]},
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "🆔 "},
+                {"type": "text", "text": "CVE: ", "marks": [{"type": "strong"}]},
+                {"type": "text", "text": vuln_id}
+            ]},
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "⚠️ "},
+                {"type": "text", "text": "Severity: ", "marks": [{"type": "strong"}]},
+                {"type": "text", "text": severity}
+            ]},
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "📊 "},
+                {"type": "text", "text": "Score: ", "marks": [{"type": "strong"}]},
+                {"type": "text", "text": str(score)}
+            ]},
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "📦 "},
+                {"type": "text", "text": "Affected Package: ", "marks": [{"type": "strong"}]},
+                {"type": "text", "text": pkg}
+            ]},
+            {"type": "heading", "attrs": {"level": 3}, "content": [
+                {"type": "text", "text": "📝 Description"}
+            ]},
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": description}
+            ]},
+            {"type": "heading", "attrs": {"level": 3}, "content": [
+                {"type": "text", "text": "🛡️ Mitigation"}
+            ]},
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": mitigation}
+            ]},
+            {"type": "heading", "attrs": {"level": 3}, "content": [
+                {"type": "text", "text": "🔎 Explanation"}
+            ]},
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": explanation}
+            ]}
+        ]
+    }
 
-*Explanation:*
-{explanation}
-""".strip()
-
-    url = "https://{JIRA_ORG}.atlassian.net/rest/api/3/issue"
+    url = f"https://{JIRA_ORG}.atlassian.net/rest/api/3/issue"
     auth = (JIRA_USERNAME, JIRA_API_KEY)
     headers = {
         "Accept": "application/json",
@@ -937,37 +980,57 @@ def create_jira_ticket(repo, vuln_id, severity):
 
     payload = {
         "fields": {
-            "project": {"key": "SECURITY"},  # Update your project key
+            "project": {"key": "SECURITY"},
             "summary": summary,
-            "description": jira_description,
-            "issuetype": {"name": "Bug"}
+            "description": jira_description_adf,
+            "issuetype": {"name": "Bug"},
+            "priority": {"name": priority},
+            "labels": ["automation_scripts", "sastsec_bug", "security_alert", "security_bug"]
         }
     }
 
     try:
+        print("[Jira Debug] Payload:")
+        print(json.dumps(payload, indent=2))
+
         response = requests.post(url, auth=auth, headers=headers, json=payload)
         response.raise_for_status()
         issue_key = response.json()["key"]
         issue_url = f"https://{JIRA_ORG}.atlassian.net/browse/{issue_key}"
 
         return {
+            "issue_url": issue_url,
+            "issue_key": issue_key,
+            "response_type": "in_channel",
+            "text": f"🎟️ Jira ticket created: <{issue_url}|{issue_key}>",
             "blocks": [
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"🎟️ *Jira Ticket Created!*\n<{issue_url}|{issue_key}> for *`{repo}`* — *{vuln_id}*"
+                        "text": (
+                            f"🎟️ *Jira ticket created:* < {issue_url} | {issue_key} >\n"
+                            f"*Repo:* `{repo}`\n"
+                            f"*CVE:* `{vuln_id}`\n"
+                            f"*Severity:* *{severity}*\n"
+                            f"*Score:* {score}"
+                        )
                     }
                 }
-            ],
-            "text": f"Jira ticket created: <{issue_url}|{issue_key}>"
+            ]
         }
 
-    except Exception as e:
+    except requests.exceptions.HTTPError as e:
         print(f"[Jira Error] {e}")
+        print(f"[Jira Response] {e.response.text}")
         return {
-            "text": f"❌ Failed to create Jira ticket for {vuln_id} — {e}"
+            "text": f"❌ Jira ticket creation failed for `{vuln_id}` — {str(e)}"
         }
+
+
+
+
+
 
 
 # Send critical vulnerability alerts to Slack

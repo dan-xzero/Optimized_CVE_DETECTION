@@ -9,6 +9,8 @@ import subprocess
 from flask import Flask, request, make_response, abort, jsonify
 from dotenv import load_dotenv
 from scanner import create_jira_ticket, send_slack_message
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
 
 
@@ -39,18 +41,35 @@ def handle_interaction():
     verify_slack_request(request)
     payload = json.loads(request.form["payload"])
     action = payload["actions"][0]
-    
 
     if action["action_id"] == "create_jira_ticket":
         repo_name, vuln_id, severity = action["value"].split("|")
         slack_response = create_jira_ticket(repo_name, vuln_id, severity)
 
-        # ✅ Send full message to channel using Webhook
-        if "blocks" in slack_response:
-            msg = f"🎟️ Jira (simulated) for `{vuln_id}` in `{repo_name}` (Severity: {severity})"
-            send_slack_message(msg)
+        # ✅ Send Slack message with blocks to the channel
+        if "issue_url" in slack_response:
+            slack_token = os.getenv("SLACK_API_TOKEN")
+            slack_channel = os.getenv("SLACK_CHANNEL_ID")
+            client = WebClient(token=slack_token)
 
-        return jsonify(slack_response)
+            try:
+                client.chat_postMessage(
+                    channel=slack_channel,
+                    blocks=slack_response["blocks"],
+                    text=slack_response["text"],  # fallback
+                    mrkdwn=True
+                )
+                print("[Slack] Jira ticket Slack message sent")
+            except SlackApiError as e:
+                print(f"[Slack Error] {e.response['error']}")
+
+        # ✅ Still respond to the button interaction (ephemeral response)
+        return jsonify({
+            "response_type": "ephemeral",
+            "text": f"🎟️ Jira ticket created: <{slack_response['issue_url']}|{slack_response['issue_key']}>"
+        })
+
+    return make_response("", 200)
 
 
 # @app.route("/slack/interactivity", methods=["POST"])
