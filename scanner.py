@@ -317,7 +317,7 @@ def openai_detailed_assessment(vuln_id, vuln_info):
     Description: {vuln_info.get('description')}
     References: {vuln_info.get('references')}
 
-    Return JSON with: detailed_description, vulnerable_package, mitigation, predicted_severity, predicted_score (0-10), explanation
+    Return JSON with: detailed_description, vulnerable_package, mitigation, predicted_severity, predicted_score (0-10), explanation and based on the prdected_score check the predicted_severity.
     """
     try:
         resp = client.chat.completions.create(
