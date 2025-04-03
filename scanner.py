@@ -492,7 +492,7 @@ def fetch_all_repositories():
         all_repos.extend(data.get("values", []))
         url = data.get("next")
     print(f"[Fetch] Total repositories fetched: {len(all_repos)}")  # 🔍 Debug line
-    return [{"name": r["name"], "clone_url": next(link["href"] for link in r["links"]["clone"] if link["name"] == "ssh")} for r in all_repos][:5]
+    return [{"name": r["name"], "clone_url": next(link["href"] for link in r["links"]["clone"] if link["name"] == "ssh")} for r in all_repos]
 
 def process_single_repository(repo, rescan_mode=False):
     repo_name = repo.get("name")
@@ -715,8 +715,8 @@ def process_nvd_feeds():
             print(f"Feed download error: {e}")
 
     # items = load_json_file(NVD_CVE_MODIFIED_JSON).get("CVE_Items", [][:5]) + load_json_file(NVD_CVE_RECENT_JSON).get("CVE_Items", [][:5])
-    items = load_json_file(NVD_CVE_MODIFIED_JSON).get("CVE_Items", [][:5]) + \
-        load_json_file(NVD_CVE_RECENT_JSON).get("CVE_Items", [][:5])
+    items = load_json_file(NVD_CVE_MODIFIED_JSON).get("CVE_Items", []) + \
+        load_json_file(NVD_CVE_RECENT_JSON).get("CVE_Items", [])
 
     conn = connect_db()
     cur = conn.cursor()
