@@ -6,8 +6,11 @@ import time
 import hmac
 import hashlib
 import subprocess
-from flask import Flask, request, make_response, abort
+from flask import Flask, request, make_response, abort, jsonify
 from dotenv import load_dotenv
+from scanner import create_jira_ticket, send_slack_message
+
+
 
 load_dotenv()
 
@@ -32,32 +35,55 @@ def verify_slack_request(req):
         abort(403)
 
 @app.route("/slack/interactivity", methods=["POST"])
-def slack_button_handler():
+def handle_interaction():
     verify_slack_request(request)
-    try:
-        payload_raw = request.form.get("payload")
-        if not payload_raw:
-            return make_response("Missing payload", 400)
+    payload = json.loads(request.form["payload"])
+    action = payload["actions"][0]
+    
 
-        payload = json.loads(payload_raw)
-        action = payload.get("actions", [{}])[0]
-        if action.get("action_id") == "rescan_repo":
-            repo_info = action.get("value", "")
-            repo_name, clone_url = repo_info.split("|")
+    if action["action_id"] == "create_jira_ticket":
+        repo_name, vuln_id, severity = action["value"].split("|")
+        slack_response = create_jira_ticket(repo_name, vuln_id, severity)
 
-            print(f"[Slack Button] Rescan triggered for {repo_name}")
-            subprocess.Popen([
-                "python3", "scan_repo_worker.py",
-                "--repo-name", repo_name,
-                "--clone-url", clone_url
-            ])
-            return make_response(f"Rescan started for {repo_name}", 200)
+        # ✅ Send full message to channel using Webhook
+        if "blocks" in slack_response:
+            msg = f"🎟️ Jira (simulated) for `{vuln_id}` in `{repo_name}` (Severity: {severity})"
+            send_slack_message(msg)
 
-    except Exception as e:
-        print(f"[Slack Button ERROR] {e}")
-        return make_response("Error processing button", 500)
+        return jsonify(slack_response)
 
-    return make_response("No action processed", 200)
+
+# @app.route("/slack/interactivity", methods=["POST"])
+# def slack_button_handler():
+#     verify_slack_request(request)
+#     try:
+#         payload_raw = request.form.get("payload")
+#         if not payload_raw:
+#             return make_response("Missing payload", 400)
+
+#         payload = json.loads(payload_raw)
+#         action = payload.get("actions", [{}])[0]
+#         if action.get("action_id") == "rescan_repo":
+#             repo_info = action.get("value", "")
+#             repo_name, clone_url = repo_info.split("|")
+
+#             print(f"[Slack Button] Rescan triggered for {repo_name}")
+#             subprocess.Popen([
+#                 "python3", "scan_repo_worker.py",
+#                 "--repo-name", repo_name,
+#                 "--clone-url", clone_url,
+#                 "--rescan" 
+#             ])
+#             return jsonify({
+#     "response_type": "in_channel",
+#     "text": f"🔄 Rescan triggered for `{repo_name}` via Slack button."
+# })
+
+#     except Exception as e:
+#         print(f"[Slack Button ERROR] {e}")
+#         return make_response("Error processing button", 500)
+
+#     return make_response("No action processed", 200)
 
 @app.route("/slack/rescan", methods=["POST"])
 def slash_rescan():
@@ -73,9 +99,13 @@ def slash_rescan():
     subprocess.Popen([
         "python3", "scan_repo_worker.py",
         "--repo-name", repo_name,
-        "--clone-url", clone_url
+        "--clone-url", clone_url,
+        "--rescan"
     ])
-    return make_response(f"🔁 Scan triggered for `{repo_name}` by {user}", 200)
+    return jsonify({
+     "response_type": "in_channel",
+     "text": f"🔄 Rescan triggered for `{repo_name}` by `{user}` using `/rescan`."
+})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=31337, debug=True)

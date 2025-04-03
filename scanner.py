@@ -32,6 +32,7 @@ NVD_API_KEY = os.getenv("NVD_API_KEY")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 SLACK_API_TOKEN = os.getenv("SLACK_API_TOKEN")
 SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")
+JIRA_ORG = os.getenv("JIRA_ORG")
 
 # Constants
 REPOS_DIR = "repos"
@@ -92,19 +93,38 @@ def send_slack_rescan_button(repo_name, clone_url):
     except SlackApiError as e:
         print(f"[Slack Error] {e.response['error']}")
 
-# scanner.py — HTML Dashboard Support (Jinja2)
-
-
-def generate_html_report(vulns, output_path="report.html"):
+def send_jira_button(repo_name, vuln_id, severity):
     try:
-        env = Environment(loader=FileSystemLoader("templates"))
-        template = env.get_template("vuln_report.html")
-        rendered = template.render(vulnerabilities=vulns)
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(rendered)
-        print(f"HTML report generated: {output_path}")
-    except Exception as e:
-        print(f"HTML render error: {e}")
+        client = WebClient(token=SLACK_API_TOKEN)
+        response = client.chat_postMessage(
+            channel=SLACK_CHANNEL_ID,
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Jira ticket for `{vuln_id}` in `{repo_name}`?*"
+                    }
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Create Jira Ticket"},
+                            "value": f"{repo_name}|{vuln_id}|{severity}",
+                            "action_id": "create_jira_ticket"
+                        }
+                    ]
+                }
+            ],
+            text=f"Jira ticket option for {vuln_id}"
+        )
+        print(f"[Slack] Jira button sent for {repo_name}/{vuln_id}")
+    except SlackApiError as e:
+        print(f"[Slack Error] {e.response['error']}")
+
+
 # Slack Notification Functions
 
 def send_slack_message(text):
@@ -167,6 +187,7 @@ def init_db():
             mitigation TEXT,
             explanation TEXT,
             false_positive BOOLEAN DEFAULT 0,
+            notified BOOLEAN DEFAULT 0,
             query_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(repository_name, vulnerability_id)
         )
@@ -195,6 +216,7 @@ def init_db():
         cpe TEXT,
         vulnerability_json TEXT,
         query_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        notified BOOLEAN DEFAULT 0,
         UNIQUE(repository_id, cve_id),
         FOREIGN KEY(repository_id) REFERENCES repositories(id)
     )
@@ -202,6 +224,7 @@ def init_db():
 
     conn.commit()
     conn.close()
+
 
 
 # OpenAI Logging
@@ -466,9 +489,9 @@ def fetch_all_repositories():
         data = resp.json()
         all_repos.extend(data.get("values", []))
         url = data.get("next")
-    return [{"name": r["name"], "clone_url": r["links"]["clone"][0]["href"]} for r in all_repos][:5]
+    return [{"name": r["name"], "clone_url": r["links"]["clone"][0]["href"]} for r in all_repos]#[:5]
 
-def process_single_repository(repo):
+def process_single_repository(repo, rescan_mode=False):
     repo_name = repo.get("name")
     clone_url = repo.get("clone_url")
     if not repo_name or not clone_url:
@@ -480,7 +503,7 @@ def process_single_repository(repo):
     remote_commit = get_remote_head_commit(clone_url)
     cur.execute("SELECT last_commit FROM repositories WHERE name = ?", (repo_name,))
     row = cur.fetchone()
-    if row and row[0] == remote_commit:
+    if row and row[0] == remote_commit and not rescan_mode:
         conn.close()
         return
 
@@ -489,9 +512,11 @@ def process_single_repository(repo):
         sbom_path = generate_sbom(repo_path, repo_name)
         grype_data = run_grype(sbom_path)
 
-        # Insert into repositories
-        cur.execute("REPLACE INTO repositories (name, clone_url, last_commit) VALUES (?, ?, ?)", (repo_name, clone_url, remote_commit))
-        conn.commit()
+        # Insert or update repository
+        cur.execute("""
+            REPLACE INTO repositories (name, clone_url, last_commit)
+            VALUES (?, ?, ?)
+        """, (repo_name, clone_url, remote_commit))
 
         # Extract config CPEs and save
         cpes = extract_cpes_from_repo(repo_path)
@@ -499,46 +524,57 @@ def process_single_repository(repo):
 
         if grype_data:
             for match in grype_data.get("matches", []):
-                
                 vuln_info = match.get("vulnerability", {})
                 vuln_id = vuln_info.get("id")
                 if not vuln_id:
                     continue
+
                 cur.execute("SELECT 1 FROM grype_vulnerabilities WHERE repository_name=? AND vulnerability_id=?", (repo_name, vuln_id))
-                if cur.fetchone():
+                already_exists = cur.fetchone()
+
+                if already_exists and not rescan_mode:
                     continue
+
                 enriched = openai_detailed_assessment(vuln_id, vuln_info)
                 db_ver = match.get("artifact", {}).get("version", "") or "unknown"
                 false_positive, fp_explanation = openai_validate_false_positive(
-                vuln_id,
-                enriched.get("detailed_description", ""),
-                enriched.get("vulnerable_package", ""),
-                db_ver
+                    vuln_id,
+                    enriched.get("detailed_description", ""),
+                    enriched.get("vulnerable_package", ""),
+                    db_ver
                 )
+
                 cur.execute("""
-    INSERT INTO grype_vulnerabilities (
-        repository_name, vulnerability_id, actual_severity,
-        predicted_severity, predicted_score, epss_score, epss_percentile,
-        detailed_description, vulnerable_package, mitigation, explanation,
-        false_positive
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-""", (
-    repo_name, vuln_id, vuln_info.get("severity"),
-    enriched.get("predicted_severity"), enriched.get("predicted_score"),
-    enriched.get("epss_score"), enriched.get("epss_percentile"),
-    enriched.get("detailed_description"), enriched.get("vulnerable_package"),
-    enriched.get("mitigation"), enriched.get("explanation"),
-    false_positive
-))
+                    INSERT INTO grype_vulnerabilities (
+                        repository_name, vulnerability_id, actual_severity,
+                        predicted_severity, predicted_score, epss_score, epss_percentile,
+                        detailed_description, vulnerable_package, mitigation, explanation,
+                        false_positive, notified
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    repo_name, vuln_id, vuln_info.get("severity"),
+                    enriched.get("predicted_severity"), enriched.get("predicted_score"),
+                    enriched.get("epss_score"), enriched.get("epss_percentile"),
+                    enriched.get("detailed_description"), enriched.get("vulnerable_package"),
+                    enriched.get("mitigation"), enriched.get("explanation"),
+                    false_positive, 0
+                ))
 
+                # ✅ Send Slack alert only in rescan mode
+                if rescan_mode and enriched.get("predicted_score", 0) >= 9 and not false_positive:
+                    clone_url = clone_url or lookup_clone_url(repo_name)
+                    send_combined_alert(repo_name, vuln_id, enriched.get("predicted_severity"), enriched.get("predicted_score"), clone_url)
 
-                conn.commit()
+        # ✅ Commit once after all vulnerabilities are inserted
+        conn.commit()
+
     except Exception as e:
         print(f"Repo {repo_name} error: {e}")
     finally:
         conn.close()
         if os.path.exists(repo_path):
             shutil.rmtree(repo_path)
+
 
 
 # scanner.py — Intelligent Workload Sharding: Repo Subprocess Execution
@@ -648,7 +684,10 @@ def process_nvd_feeds():
         except Exception as e:
             print(f"Feed download error: {e}")
 
-    items = load_json_file(NVD_CVE_MODIFIED_JSON).get("CVE_Items", []) + load_json_file(NVD_CVE_RECENT_JSON).get("CVE_Items", [])
+    # items = load_json_file(NVD_CVE_MODIFIED_JSON).get("CVE_Items", [][:5]) + load_json_file(NVD_CVE_RECENT_JSON).get("CVE_Items", [][:5])
+    items = load_json_file(NVD_CVE_MODIFIED_JSON).get("CVE_Items", []) + \
+        load_json_file(NVD_CVE_RECENT_JSON).get("CVE_Items", [])
+
     conn = connect_db()
     cur = conn.cursor()
     cur.execute("""
@@ -720,6 +759,33 @@ def query_nvd_rest_api(cve_id, max_retries=3, delay=2):
 # scanner.py — All-in-One Vulnerability Scanner (Final Part)
 # Adds: Vulnerability aggregation, Slack upload, critical alert, and main entrypoint
 
+def send_combined_alert(repo, cve_id, severity, score, clone_url):
+    client = WebClient(token=SLACK_API_TOKEN)
+    client.chat_postMessage(
+        channel=SLACK_CHANNEL_ID,
+        blocks=[
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f":rotating_light: *Critical Vulnerability Detected!*\n*Repo:* `{repo}`\n*CVE:* `{cve_id}`\n*Severity:* {severity} (Score: {score})"
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Create Jira Ticket"},
+                        "value": f"{repo}|{cve_id}|{severity}",
+                        "action_id": "create_jira_ticket"
+                    }
+                ]
+            }
+        ],
+        text=f"Critical vulnerability in {repo}"
+    )
+
 # Aggregate vulnerabilities
 
 def aggregate_vulnerabilities():
@@ -759,31 +825,83 @@ def aggregate_vulnerabilities():
 
 # scanner.py — (Commented) Jira Ticket Creation Stub
 
-# Optional: Jira Ticket Creation — Requires Atlassian Cloud
-# def create_jira_ticket(repo, vuln_id, severity, summary):
-#     url = "https://your-domain.atlassian.net/rest/api/3/issue"
-#     auth = (ATLASSIAN_USERNAME, ATLASSIAN_API_KEY)
-#     headers = {
-#         "Accept": "application/json",
-#         "Content-Type": "application/json"
-#     }
-#     payload = {
-#         "fields": {
-#             "project": {"key": "SEC"},  # Your Jira project key
-#             "summary": f"{severity} vuln in {repo}: {vuln_id}",
-#             "description": summary,
-#             "issuetype": {"name": "Bug"}
-#         }
-#     }
-#     try:
-#         r = requests.post(url, auth=auth, headers=headers, json=payload)
-#         r.raise_for_status()
-#         print(f"Jira ticket created for {repo}/{vuln_id}")
-#     except Exception as e:
-#         print(f"[Jira Error] {e}")
+def create_jira_ticket(repo, vuln_id, severity):
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT detailed_description, vulnerable_package, mitigation, explanation, predicted_score, epss_score
+        FROM grype_vulnerabilities
+        WHERE repository_name = ? AND vulnerability_id = ?
+    """, (repo, vuln_id))
+    row = cur.fetchone()
+    conn.close()
 
-# You could call this inside send_critical_vuln_alerts():
-# create_jira_ticket(repo_name, vuln_id, severity, v['detailed_description'])
+    if not row:
+        return {
+            "text": f"❌ Could not find details for {vuln_id} in {repo}."
+        }
+
+    description, pkg, mitigation, explanation, score, epss = row
+
+    summary = f"{severity} vulnerability in {repo}: {vuln_id}"
+    jira_description = f"""
+*Repository:* `{repo}`
+*CVE:* `{vuln_id}`
+*Severity:* {severity}
+*Score:* {score}
+*EPSS:* {epss}
+*Affected Package:* {pkg}
+
+*Description:*
+{description}
+
+*Mitigation Recommendation:*
+{mitigation}
+
+*Explanation:*
+{explanation}
+""".strip()
+
+    url = "https://{JIRA_ORG}.atlassian.net/rest/api/3/issue"
+    auth = (ATLASSIAN_USERNAME, ATLASSIAN_API_KEY)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "fields": {
+            "project": {"key": "SECURITY"},  # Update your project key
+            "summary": summary,
+            "description": jira_description,
+            "issuetype": {"name": "Bug"}
+        }
+    }
+
+    try:
+        response = requests.post(url, auth=auth, headers=headers, json=payload)
+        response.raise_for_status()
+        issue_key = response.json()["key"]
+        issue_url = f"https://{JIRA_ORG}.atlassian.net/browse/{issue_key}"
+
+        return {
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"🎟️ *Jira Ticket Created!*\n<{issue_url}|{issue_key}> for *`{repo}`* — *{vuln_id}*"
+                    }
+                }
+            ],
+            "text": f"Jira ticket created: <{issue_url}|{issue_key}>"
+        }
+
+    except Exception as e:
+        print(f"[Jira Error] {e}")
+        return {
+            "text": f"❌ Failed to create Jira ticket for {vuln_id} — {e}"
+        }
 
 
 # Send critical vulnerability alerts to Slack
@@ -797,27 +915,38 @@ def lookup_clone_url(repo_name):
     return row[0] if row else "unknown"
 
 def send_critical_vuln_alerts(vulns):
-    criticals = [v for v in vulns if v.get("predicted_score", 0) >= 9 and not v.get("false_positive")]
+    conn = connect_db()
+    cur = conn.cursor()
+
+    # Only fetch unnotified criticals
+    cur.execute("""
+        SELECT repository_name, vulnerability_id, predicted_severity, predicted_score
+        FROM grype_vulnerabilities
+        WHERE predicted_score >= 9 AND false_positive = 0 AND notified = 0
+    """)
+    criticals = cur.fetchall()
+
     if not criticals:
+        send_slack_message(":white_check_mark: No new critical vulnerabilities found.")
+        conn.close()
         return
 
-    for v in criticals:
-        repo_name = v['repository']
-        vuln_id = v['vulnerability_id']
-        score = v['predicted_score']
-        severity = v['predicted_severity']
-
-        message = (
-            f":rotating_light: *Critical Vulnerability Detected!*\n"
-            f"*Repo:* `{repo_name}`\n"
-            f"*CVE:* `{vuln_id}`\n"
-            f"*Severity:* {severity} (Score: {score})"
-        )
-        send_slack_message(message)
-
-        # 🔘 Automatically attach rescan button
+    for repo_name, vuln_id, severity, score in criticals:
         clone_url = lookup_clone_url(repo_name)
-        send_slack_rescan_button(repo_name, clone_url)
+        send_combined_alert(repo_name, vuln_id, severity, score, clone_url)
+
+        # Mark as notified
+        cur.execute("""
+            UPDATE grype_vulnerabilities
+            SET notified = 1
+            WHERE repository_name = ? AND vulnerability_id = ?
+        """, (repo_name, vuln_id))
+
+    conn.commit()
+    conn.close()
+
+
+
 # Final Entry Point
 
 def run_main():
@@ -826,6 +955,7 @@ def run_main():
     os.makedirs(NVD_CVE_FEED_FOLDER, exist_ok=True)
 
     init_db()
+    patch_add_notified_columns()
     send_slack_message(":rocket: Vulnerability scan started.")
     process_repositories_parallel()
     process_nvd_feeds()
@@ -836,7 +966,21 @@ def run_main():
         send_slack_file(OUTPUT_AGGREGATED_FILE, ":warning: Vulnerability report attached")
     else:
         send_slack_message(":white_check_mark: No high-severity vulnerabilities found.")
-    generate_html_report(vulns)
+
+
+def patch_add_notified_columns():
+    conn = connect_db()
+    cur = conn.cursor()
+    try:
+        cur.execute("ALTER TABLE grype_vulnerabilities ADD COLUMN notified BOOLEAN DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cur.execute("ALTER TABLE nvd_vulnerabilities ADD COLUMN notified BOOLEAN DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
+    conn.close()
 
 # Main Runner
 if __name__ == "__main__":
