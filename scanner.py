@@ -137,7 +137,7 @@ def send_slack_message(text):
 
 def send_slack_file(filepath, initial_comment=None):
     command = [
-        "python", "file_upload.py",
+        "python3.9", "file_upload.py",
         f'--token="{SLACK_API_TOKEN}"',
         f'--file="{filepath}"',
         f'--channels="{SLACK_CHANNEL_ID}"'
@@ -492,7 +492,7 @@ def fetch_all_repositories():
         all_repos.extend(data.get("values", []))
         url = data.get("next")
     print(f"[Fetch] Total repositories fetched: {len(all_repos)}")  # 🔍 Debug line
-    return [{"name": r["name"], "clone_url": r["links"]["clone"][0]["href"]} for r in all_repos]
+    return [{"name": r["name"], "clone_url": r["links"]["clone"][0]["href"]} for r in all_repos][:5]
 
 def process_single_repository(repo, rescan_mode=False):
     repo_name = repo.get("name")
@@ -596,7 +596,7 @@ def process_repositories_parallel():
 
         log_file = open(f"logs/{name}.log", "w")
         cmd = [
-            "python3", "scan_repo_worker.py",
+            "python3.9", "scan_repo_worker.py",
             "--repo-name", name,
             "--clone-url", url
         ]
@@ -688,8 +688,8 @@ def process_nvd_feeds():
             print(f"Feed download error: {e}")
 
     # items = load_json_file(NVD_CVE_MODIFIED_JSON).get("CVE_Items", [][:5]) + load_json_file(NVD_CVE_RECENT_JSON).get("CVE_Items", [][:5])
-    items = load_json_file(NVD_CVE_MODIFIED_JSON).get("CVE_Items", []) + \
-        load_json_file(NVD_CVE_RECENT_JSON).get("CVE_Items", [])
+    items = load_json_file(NVD_CVE_MODIFIED_JSON).get("CVE_Items", [][:5]) + \
+        load_json_file(NVD_CVE_RECENT_JSON).get("CVE_Items", [][:5])
 
     conn = connect_db()
     cur = conn.cursor()
