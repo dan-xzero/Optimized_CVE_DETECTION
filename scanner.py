@@ -33,7 +33,8 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 SLACK_API_TOKEN = os.getenv("SLACK_API_TOKEN")
 SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")
 JIRA_ORG = os.getenv("JIRA_ORG")
-
+JIRA_USERNAME = os.getenv("JIRA_USERNAME")
+JIRA_API_KEY = os.getenv("JIRA_API_KEY")
 # Constants
 REPOS_DIR = "repos"
 SBOMS_DIR = "sboms"
@@ -863,7 +864,7 @@ def create_jira_ticket(repo, vuln_id, severity):
 """.strip()
 
     url = "https://{JIRA_ORG}.atlassian.net/rest/api/3/issue"
-    auth = (ATLASSIAN_USERNAME, ATLASSIAN_API_KEY)
+    auth = (JIRA_USERNAME, JIRA_API_KEY)
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json"

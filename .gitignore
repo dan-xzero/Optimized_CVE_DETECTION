@@ -27,3 +27,4 @@ frontend/node_modules/
 .vscode/
 .idea/
 .DS_Store
+repo_vuln.db-journal
