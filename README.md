@@ -75,8 +75,8 @@ DATABASE_URL=postgresql://User:Password@localhost:5432/repo_vuln
 ### 1. Clone the Repo
 
 ```bash
-git clone https://github.com/your-org/vulnerability-scanner.git
-cd vulnerability-scanner
+git clone https://github.com/your-org/Optimized_CVE_DETECTION.git
+cd Optimized_CVE_DETECTION
 ```
 
 ### 2. Install Dependencies
@@ -172,4 +172,5 @@ Severity: Critical (Score: 9.8)
 ## 👨‍💻 Maintainers
 
 danxzero
+
 Contributions & feedback welcome!
