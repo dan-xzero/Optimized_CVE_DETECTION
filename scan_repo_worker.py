@@ -3,7 +3,7 @@ import os
 import sys
 import argparse
 from dotenv import load_dotenv
-from scanner import process_single_repository, aggregate_vulnerabilities, send_slack_message
+from scanner_postgress import process_single_repository, aggregate_vulnerabilities, send_slack_message
 
 
 # Argument Parsing
@@ -19,7 +19,7 @@ rescan_mode = args.rescan
 
 # Adjust path and load
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".")))
-from scanner import process_single_repository
+from scanner_postgress import process_single_repository
 load_dotenv()
 
 # Run

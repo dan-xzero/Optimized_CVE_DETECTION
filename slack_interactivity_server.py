@@ -8,7 +8,7 @@ import hashlib
 import subprocess
 from flask import Flask, request, make_response, abort, jsonify
 from dotenv import load_dotenv
-from scanner import create_jira_ticket, send_slack_message
+from scanner_postgress import create_jira_ticket, send_slack_message
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 

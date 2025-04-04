@@ -4,23 +4,29 @@
 import os
 import io
 import json
-import sqlite3
 import shutil
 import subprocess
 import time
-import urllib.parse
 import zipfile
 import datetime
-import requests
-from threading import Lock
-from packaging.version import parse as parse_version
-from concurrent.futures import ThreadPoolExecutor
+import urllib.parse
 import multiprocessing
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
 from dotenv import load_dotenv
+from packaging.version import parse as parse_version
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from openai import OpenAI
 from jinja2 import Environment, FileSystemLoader
+
+from sqlalchemy.exc import OperationalError, IntegrityError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from db import SessionLocal, engine
+from models import Base, Repository, GrypeVulnerability, NvdVulnerability, RepositoryCpe
+
 
 # Load environment variables
 load_dotenv(override=True)
@@ -38,7 +44,6 @@ JIRA_API_KEY = os.getenv("JIRA_API_KEY")
 # Constants
 REPOS_DIR = "repos"
 SBOMS_DIR = "sboms"
-DB_FILE = "repo_vuln.db"
 OPENAI_LOG_FILE = "openai_logs.txt"
 OUTPUT_AGGREGATED_FILE = "aggregated_vulnerabilities.json"
 NVD_CVE_FEED_FOLDER = "nvdcve_feed"
@@ -61,6 +66,7 @@ print(f"[Thread Config] Detected {CPU_COUNT} cores — using {MAX_THREADS} threa
 client = OpenAI(api_key=OPENAI_API_KEY)
 openai_cache = {}
 openai_lock = Lock()
+
 
 
 def send_slack_rescan_button(repo_name, clone_url):
@@ -137,7 +143,7 @@ def send_slack_message(text):
 
 def send_slack_file(filepath, initial_comment=None):
     command = [
-        "python3.9", "file_upload.py",
+        "python", "file_upload.py",
         f'--token="{SLACK_API_TOKEN}"',
         f'--file="{filepath}"',
         f'--channels="{SLACK_CHANNEL_ID}"'
@@ -152,105 +158,15 @@ def send_slack_file(filepath, initial_comment=None):
 # scanner.py — All-in-One Vulnerability Scanner (Part 2/??)
 # Adds DB setup, OpenAI logging/parsing, and multiprocessing-ready NVD CVE match support
 
-# SQLite DB Initialization
+# postgres DB Initialization
 
 def connect_db():
-    conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
+    return SessionLocal()
 
-# ---- Retry-safe DB write function ----
-def safe_db_write(cur, query, params, retries=5, delay=1):
-    for attempt in range(retries):
-        try:
-            cur.execute(query, params)
-            return
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e).lower():
-                print(f"[DB Retry] Attempt {attempt+1}: database is locked. Retrying in {delay}s...")
-                time.sleep(delay)
-            else:
-                raise
-    raise RuntimeError("Exceeded max retries for database write.")
 
 def init_db():
-    conn = connect_db()
-    cur = conn.cursor()
-
-    # Repositories Table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS repositories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE,
-            clone_url TEXT,
-            last_commit TEXT,
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Grype Vulnerabilities Table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS grype_vulnerabilities (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            repository_name TEXT,
-            vulnerability_id TEXT,
-            actual_severity TEXT,
-            predicted_severity TEXT,
-            predicted_score REAL,
-            epss_score REAL,
-            epss_percentile REAL,
-            detailed_description TEXT,
-            vulnerable_package TEXT,
-            mitigation TEXT,
-            explanation TEXT,
-            false_positive BOOLEAN DEFAULT 0,
-            notified BOOLEAN DEFAULT 0,
-            query_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(repository_name, vulnerability_id)
-        )
-    """)
-
-    # Repository CPEs Table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS repository_cpes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            repository_id INTEGER,
-            cpe TEXT,
-            vendor TEXT,
-            product TEXT,
-            version TEXT,
-            UNIQUE(repository_id, cpe),
-            FOREIGN KEY(repository_id) REFERENCES repositories(id)
-        )
-    """)
-
-    # NVD Vulnerabilities Table
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS nvd_vulnerabilities (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        repository_name TEXT,
-        vulnerability_id TEXT,
-        actual_severity TEXT,
-        predicted_severity TEXT,
-        predicted_score REAL,
-        epss_score REAL,
-        epss_percentile REAL,
-        detailed_description TEXT,
-        vulnerable_package TEXT,
-        mitigation TEXT,
-        explanation TEXT,
-        false_positive BOOLEAN DEFAULT 0,
-        notified BOOLEAN DEFAULT 0,
-        query_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(repository_name, vulnerability_id)
-    )
-""")
-
-
-    conn.commit()
-    conn.close()
-
+    Base.metadata.drop_all(bind=engine)  # optional: resets all tables
+    Base.metadata.create_all(bind=engine)
 
 
 # OpenAI Logging
@@ -302,6 +218,8 @@ def openai_validate_false_positive(cve_id, description, package_name, repo_versi
     except Exception as e:
         print(f"OpenAI FP error for {cve_id}: {e}")
         return False, "(Validation failed)"
+
+
 
 # scanner.py — Enhanced with EPSS Score Integration (Shodan)
 
@@ -475,28 +393,40 @@ def extract_cpes_from_repo(repo_path):
 
 # Save Extracted CPEs to DB
 
+
 def save_repository_cpes(repo_name, cpe_list):
-    conn = connect_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM repositories WHERE name = ?", (repo_name,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return
-    repo_id = row[0]
-    for entry in cpe_list:
-        vendor = entry.get("vendor")
-        product = entry.get("product")
-        version = entry.get("version")
-        if vendor and product and version:
-            cpe_str = f"cpe:2.3:a:{vendor}:{product}:{version}:*:*:*:*:*:*:*"
-            safe_db_write(cur, """
-                INSERT OR IGNORE INTO repository_cpes 
-                (repository_id, cpe, vendor, product, version)
-                VALUES (?, ?, ?, ?, ?)
-            """, (repo_id, cpe_str, vendor, product, version))
-    conn.commit()
-    conn.close()
+    session = connect_db()
+    try:
+        repo = session.query(Repository).filter_by(name=repo_name).first()
+        if not repo:
+            return
+
+        for entry in cpe_list:
+            vendor = entry.get("vendor")
+            product = entry.get("product")
+            version = entry.get("version")
+            if vendor and product and version:
+                cpe_str = f"cpe:2.3:a:{vendor}:{product}:{version}:*:*:*:*:*:*:*"
+
+                stmt = pg_insert(RepositoryCpe).values(
+                    repository_id=repo.id,
+                    cpe=cpe_str,
+                    vendor=vendor,
+                    product=product,
+                    version=version
+                ).on_conflict_do_nothing(
+                    index_elements=["repository_id", "cpe"]
+                )
+
+                session.execute(stmt)
+
+        session.commit()
+
+    except Exception as e:
+        session.rollback()
+        print(f"[DB] Error while saving CPEs for {repo_name}: {e}")
+    finally:
+        session.close()
 
 # Next: Parallel repo processing, vulnerability insert, NVD feed parsing (with multiprocessing)
 # Ready to continue?
@@ -516,8 +446,19 @@ def fetch_all_repositories():
         data = resp.json()
         all_repos.extend(data.get("values", []))
         url = data.get("next")
-    print(f"[Fetch] Total repositories fetched: {len(all_repos)}")  # 🔍 Debug line
-    return [{"name": r["name"], "clone_url": next(link["href"] for link in r["links"]["clone"] if link["name"] == "ssh")} for r in all_repos]
+    
+    print(f"[Fetch] Total repositories fetched: {len(all_repos)}")
+
+    repositories = []
+    for r in all_repos:
+        name = r.get("name")
+        ssh_link = next((link["href"] for link in r.get("links", {}).get("clone", []) if link["name"] == "ssh"), None)
+        if name and ssh_link:
+            repositories.append({"name": name, "clone_url": ssh_link})
+        else:
+            print(f"[Skip] Repository {name} missing SSH clone URL")
+
+    return repositories
 
 def process_single_repository(repo, rescan_mode=False):
     repo_name = repo.get("name")
@@ -525,14 +466,12 @@ def process_single_repository(repo, rescan_mode=False):
     if not repo_name or not clone_url:
         return
 
-    conn = connect_db()
-    cur = conn.cursor()
-
+    session = connect_db()  # SQLAlchemy session
     remote_commit = get_remote_head_commit(clone_url)
-    cur.execute("SELECT last_commit FROM repositories WHERE name = ?", (repo_name,))
-    row = cur.fetchone()
-    if row and row[0] == remote_commit and not rescan_mode:
-        conn.close()
+
+    repo_obj = session.query(Repository).filter_by(name=repo_name).first()
+    if repo_obj and repo_obj.last_commit == remote_commit and not rescan_mode:
+        session.close()
         return
 
     try:
@@ -541,10 +480,14 @@ def process_single_repository(repo, rescan_mode=False):
         grype_data = run_grype(sbom_path)
 
         # Insert or update repository
-        safe_db_write(cur, """
-            REPLACE INTO repositories (name, clone_url, last_commit)
-            VALUES (?, ?, ?)
-        """, (repo_name, clone_url, remote_commit))
+        if not repo_obj:
+            repo_obj = Repository(name=repo_name, clone_url=clone_url, last_commit=remote_commit)
+            session.add(repo_obj)
+        else:
+            repo_obj.clone_url = clone_url
+            repo_obj.last_commit = remote_commit
+
+        session.commit()
 
         # Extract config CPEs and save
         cpes = extract_cpes_from_repo(repo_path)
@@ -557,12 +500,6 @@ def process_single_repository(repo, rescan_mode=False):
                 if not vuln_id:
                     continue
 
-                cur.execute("SELECT 1 FROM grype_vulnerabilities WHERE repository_name=? AND vulnerability_id=?", (repo_name, vuln_id))
-                already_exists = cur.fetchone()
-
-                if already_exists and not rescan_mode:
-                    continue
-
                 enriched = openai_detailed_assessment(vuln_id, vuln_info)
                 db_ver = match.get("artifact", {}).get("version", "") or "unknown"
                 false_positive, fp_explanation = openai_validate_false_positive(
@@ -572,36 +509,42 @@ def process_single_repository(repo, rescan_mode=False):
                     db_ver
                 )
 
-                safe_db_write(cur, """
-                    INSERT INTO grype_vulnerabilities (
-                        repository_name, vulnerability_id, actual_severity,
-                        predicted_severity, predicted_score, epss_score, epss_percentile,
-                        detailed_description, vulnerable_package, mitigation, explanation,
-                        false_positive, notified
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    repo_name, vuln_id, vuln_info.get("severity"),
-                    enriched.get("predicted_severity"), enriched.get("predicted_score"),
-                    enriched.get("epss_score"), enriched.get("epss_percentile"),
-                    enriched.get("detailed_description"), enriched.get("vulnerable_package"),
-                    enriched.get("mitigation"), enriched.get("explanation"),
-                    false_positive, 0
-                ))
+                # ✅ Conflict-safe insert with PostgreSQL dialect
+                stmt = pg_insert(GrypeVulnerability).values(
+                    repository_name=repo_name,
+                    vulnerability_id=vuln_id,
+                    actual_severity=vuln_info.get("severity"),
+                    predicted_severity=enriched.get("predicted_severity"),
+                    predicted_score=enriched.get("predicted_score"),
+                    epss_score=enriched.get("epss_score"),
+                    epss_percentile=enriched.get("epss_percentile"),
+                    detailed_description=enriched.get("detailed_description"),
+                    vulnerable_package=enriched.get("vulnerable_package"),
+                    mitigation=enriched.get("mitigation"),
+                    explanation=enriched.get("explanation"),
+                    false_positive=false_positive,
+                    notified=False
+                ).on_conflict_do_nothing(
+                    index_elements=["repository_name", "vulnerability_id"]
+                )
 
-                # ✅ Send Slack alert only in rescan mode
+                session.execute(stmt)
+
                 if rescan_mode and enriched.get("predicted_score", 0) >= 9 and not false_positive:
                     clone_url = clone_url or lookup_clone_url(repo_name)
                     send_combined_alert(repo_name, vuln_id, enriched.get("predicted_severity"), enriched.get("predicted_score"), clone_url)
 
-        # ✅ Commit once after all vulnerabilities are inserted
-        conn.commit()
+        session.commit()
 
     except Exception as e:
         print(f"Repo {repo_name} error: {e}")
+        session.rollback()
     finally:
-        conn.close()
+        session.close()
         if os.path.exists(repo_path):
             shutil.rmtree(repo_path)
+
+
 
 
 
@@ -621,7 +564,7 @@ def process_repositories_parallel():
 
         log_file = open(f"logs/{name}.log", "w")
         cmd = [
-            "python3.9", "scan_repo_worker.py",
+            "python", "scan_repo_worker.py",
             "--repo-name", name,
             "--clone-url", url
         ]
@@ -739,49 +682,58 @@ def process_nvd_feeds():
         except Exception as e:
             print(f"Feed download error: {e}")
 
-    # items = load_json_file(NVD_CVE_MODIFIED_JSON).get("CVE_Items", [][:5]) + load_json_file(NVD_CVE_RECENT_JSON).get("CVE_Items", [][:5])
     items = load_json_file(NVD_CVE_MODIFIED_JSON).get("CVE_Items", []) + \
-        load_json_file(NVD_CVE_RECENT_JSON).get("CVE_Items", [])
+            load_json_file(NVD_CVE_RECENT_JSON).get("CVE_Items", [])
 
-    conn = connect_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT r.id, r.name, c.vendor, c.product, c.version
-        FROM repository_cpes c
-        JOIN repositories r ON c.repository_id = r.id
-    """)
-    cpe_records = cur.fetchall()
-    conn.close()
+    # Fetch CPEs
+    with SessionLocal() as session:
+        cpe_records = session.query(
+            RepositoryCpe.repository_id,
+            Repository.name,
+            RepositoryCpe.vendor,
+            RepositoryCpe.product,
+            RepositoryCpe.version
+        ).join(Repository, RepositoryCpe.repository_id == Repository.id).all()
 
+    # Parallel CVE enrichment
     with multiprocessing.Pool(processes=CPU_COUNT) as pool:
         results = pool.map(process_single_cve, [(item, cpe_records) for item in items])
 
-    conn = connect_db()
-    cur = conn.cursor()
-    for result in results:
-        if result:
+    # Insert results into DB
+    with SessionLocal() as session:
+        for result in results:
+            if not result:
+                continue
             repo_name, cve_id, enriched, false_positive = result
-            cur.execute("SELECT 1 FROM grype_vulnerabilities WHERE repository_name=? AND vulnerability_id=?", (repo_name, cve_id))
-            if not cur.fetchone():
-                safe_db_write(cur, """
-    INSERT INTO nvd_vulnerabilities (
-        repository_name, vulnerability_id, actual_severity,
-        predicted_severity, predicted_score, epss_score, epss_percentile,
-        detailed_description, vulnerable_package, mitigation, explanation,
-        false_positive, notified
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-""", (
-    repo_name, cve_id, "NVD",
-    enriched.get("predicted_severity"), enriched.get("predicted_score"),
-    enriched.get("epss_score"), enriched.get("epss_percentile"),
-    enriched.get("detailed_description"), enriched.get("vulnerable_package"),
-    enriched.get("mitigation"), enriched.get("explanation"),
-    false_positive, 0  # 0 means not notified yet
-))
 
-    conn.commit()
-    conn.close()
-    print("NVD feed processing complete.")
+            # Check if vulnerability already exists
+            exists = session.query(NvdVulnerability).filter_by(
+                repository_name=repo_name,
+                vulnerability_id=cve_id
+            ).first()
+            if exists:
+                continue
+
+            vuln = NvdVulnerability(
+                repository_name=repo_name,
+                vulnerability_id=cve_id,
+                actual_severity="NVD",
+                predicted_severity=enriched.get("predicted_severity"),
+                predicted_score=enriched.get("predicted_score"),
+                epss_score=enriched.get("epss_score"),
+                epss_percentile=enriched.get("epss_percentile"),
+                detailed_description=enriched.get("detailed_description"),
+                vulnerable_package=enriched.get("vulnerable_package"),
+                mitigation=enriched.get("mitigation"),
+                explanation=enriched.get("explanation"),
+                false_positive=false_positive,
+                notified=False
+            )
+            session.add(vuln)
+        session.commit()
+
+    print("✅ NVD feed processing complete.")
+
     
 # Shared tracker across calls
 nvd_last_reset = time.time()
@@ -824,12 +776,13 @@ def query_nvd_rest_api(cve_id, max_retries=3, delay=2):
 
             if resp.status_code == 403:
                 print(f"[DEBUG] 403 Forbidden — API key may be rate-limited.")
-                time.sleep(delay)
+                time.sleep(delay * attempt)
                 continue
 
             resp.raise_for_status()
             results = resp.json().get("vulnerabilities", [])
-            return results[0].get("cve") if results else None
+            if results and isinstance(results[0], dict):
+                return results[0].get("cve")
 
         except Exception as e:
             print(f"[NVD ERROR] {cve_id} — {e}")
@@ -872,35 +825,24 @@ def send_combined_alert(repo, cve_id, severity, score, clone_url):
 # Aggregate vulnerabilities
 
 def aggregate_vulnerabilities():
-    conn = connect_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT repository_name, vulnerability_id, actual_severity,
-       predicted_severity, predicted_score, epss_score, epss_percentile,
-       detailed_description, vulnerable_package, mitigation, explanation,
-       false_positive
-        FROM grype_vulnerabilities
-    """)
-    rows = cur.fetchall()
-    conn.close()
-
+    session = connect_db()
+    rows = session.query(GrypeVulnerability).all()
     results = [
         {
-            "repository": r[0],
-            "vulnerability_id": r[1],
-            "actual_severity": r[2],
-            "predicted_severity": r[3],
-            "predicted_score": r[4],
-            "epss_score": r[5],
-            "epss_percentile": r[6],
-            "detailed_description": r[7],
-            "vulnerable_package": r[8],
-            "mitigation": r[9],
-            "explanation": r[10],
-            "false_positive": r[11]
+            "repository": r.repository_name,
+            "vulnerability_id": r.vulnerability_id,
+            "actual_severity": r.actual_severity,
+            "predicted_severity": r.predicted_severity,
+            "predicted_score": r.predicted_score,
+            "epss_score": r.epss_score,
+            "epss_percentile": r.epss_percentile,
+            "detailed_description": r.detailed_description,
+            "vulnerable_package": r.vulnerable_package,
+            "mitigation": r.mitigation,
+            "explanation": r.explanation,
+            "false_positive": r.false_positive
         } for r in rows
     ]
-
     with open(OUTPUT_AGGREGATED_FILE, "w") as f:
         json.dump(results, f, indent=2)
 
@@ -912,15 +854,16 @@ def create_jira_ticket(repo, vuln_id, severity):
     import json
     from datetime import datetime
 
-    conn = connect_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT detailed_description, vulnerable_package, mitigation, explanation, predicted_score
-        FROM grype_vulnerabilities
-        WHERE repository_name = ? AND vulnerability_id = ?
-    """, (repo, vuln_id))
-    row = cur.fetchone()
-    conn.close()
+    # Use SQLAlchemy session
+    session = connect_db()
+    row = session.query(
+        GrypeVulnerability.detailed_description,
+        GrypeVulnerability.vulnerable_package,
+        GrypeVulnerability.mitigation,
+        GrypeVulnerability.explanation,
+        GrypeVulnerability.predicted_score
+    ).filter_by(repository_name=repo, vulnerability_id=vuln_id).first()
+    session.close()
 
     if not row:
         return {
@@ -930,7 +873,6 @@ def create_jira_ticket(repo, vuln_id, severity):
     description, pkg, mitigation, explanation, score = row
 
     summary = f"{severity} vulnerability in {repo}: {vuln_id}"
-
     priority = {
         "CRITICAL": "Critical",
         "HIGH": "High",
@@ -1026,7 +968,7 @@ def create_jira_ticket(repo, vuln_id, severity):
                     "text": {
                         "type": "mrkdwn",
                         "text": (
-                            f"🎟️ *Jira ticket created:* < {issue_url} | {issue_key} >\n"
+                            f"🎟️ *Jira ticket created:* <{issue_url}|{issue_key}>\n"
                             f"*Repo:* `{repo}`\n"
                             f"*CVE:* `{vuln_id}`\n"
                             f"*Severity:* *{severity}*\n"
@@ -1045,53 +987,39 @@ def create_jira_ticket(repo, vuln_id, severity):
         }
 
 
-
-
-
-
-
 # Send critical vulnerability alerts to Slack
 
 def lookup_clone_url(repo_name):
-    conn = connect_db()
-    cur = conn.cursor()
-    cur.execute("SELECT clone_url FROM repositories WHERE name = ?", (repo_name,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else "unknown"
+    session = connect_db()
+    try:
+        repo = session.query(Repository).filter_by(name=repo_name).first()
+        return repo.clone_url if repo else "unknown"
+    finally:
+        session.close()
 
 def send_critical_vuln_alerts(vulns):
-    conn = connect_db()
-    cur = conn.cursor()
+    session = connect_db()
 
-    # Only fetch unnotified criticals
-    cur.execute("""
-        SELECT repository_name, vulnerability_id, predicted_severity, predicted_score
-        FROM grype_vulnerabilities
-        WHERE predicted_score >= 9 AND false_positive = 0 AND notified = 0
-    """)
-    criticals = cur.fetchall()
+    criticals = session.query(GrypeVulnerability).filter(
+        GrypeVulnerability.predicted_score >= 9,
+        GrypeVulnerability.false_positive == False,
+        GrypeVulnerability.notified == False
+    ).all()
 
     if not criticals:
         send_slack_message(":white_check_mark: No new critical vulnerabilities found.")
-        conn.close()
+        session.close()
         return
 
-    for repo_name, vuln_id, severity, score in criticals:
-        clone_url = lookup_clone_url(repo_name)
-        send_combined_alert(repo_name, vuln_id, severity, score, clone_url)
+    for vuln in criticals:
+        clone_url = lookup_clone_url(vuln.repository_name)
+        send_combined_alert(vuln.repository_name, vuln.vulnerability_id, vuln.predicted_severity, vuln.predicted_score, clone_url)
 
         # Mark as notified
-        safe_db_write(cur, """
-            UPDATE grype_vulnerabilities
-            SET notified = 1
-            WHERE repository_name = ? AND vulnerability_id = ?
-        """, (repo_name, vuln_id))
+        vuln.notified = True
 
-    conn.commit()
-    conn.close()
-
-
+    session.commit()
+    session.close()
 
 # Final Entry Point
 
@@ -1100,33 +1028,20 @@ def run_main():
     os.makedirs(SBOMS_DIR, exist_ok=True)
     os.makedirs(NVD_CVE_FEED_FOLDER, exist_ok=True)
 
-    init_db()
-    patch_add_notified_columns()
+    init_db()  # ORM-based initialization
     send_slack_message(":rocket: Vulnerability scan started.")
+
     process_repositories_parallel()
     process_nvd_feeds()
 
-    vulns = aggregate_vulnerabilities()
-    if vulns:
-        send_critical_vuln_alerts(vulns)
+    vulnerabilities = aggregate_vulnerabilities()
+    if vulnerabilities:
+        send_critical_vuln_alerts(vulnerabilities)
         send_slack_file(OUTPUT_AGGREGATED_FILE, ":warning: Vulnerability report attached")
     else:
         send_slack_message(":white_check_mark: No high-severity vulnerabilities found.")
 
 
-def patch_add_notified_columns():
-    conn = connect_db()
-    cur = conn.cursor()
-    try:
-        cur.execute("ALTER TABLE grype_vulnerabilities ADD COLUMN notified BOOLEAN DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        cur.execute("ALTER TABLE nvd_vulnerabilities ADD COLUMN notified BOOLEAN DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-    conn.commit()
-    conn.close()
 
 ## Main Runner
 if __name__ == "__main__":

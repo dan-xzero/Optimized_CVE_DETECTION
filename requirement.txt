@@ -1,12 +1,10 @@
 requests
+python-dotenv
 slack_sdk
 openai
-python-dotenv
-packaging
-flask
 jinja2
-# For SBOM parsing
-cyclonedx-python-lib
-
-# For SQLite DB viewing
-sqlite-utils
+psycopg2-binary
+sqlalchemy
+packaging
+syft==1.0.0  # adjust as per your local install
+grype==0.70.0  # adjust as needed if using CLI directly

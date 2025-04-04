@@ -1,0 +1,15 @@
+docker run --name vulnscanner-postgres \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=secret \
+  -e POSTGRES_DB=repo_vuln \
+  -p 5432:5432 \
+  -d postgres:15
+
+
+
+Reset the database (optional)
+
+If you want a clean slate:
+
+docker exec -it vulnscanner-postgres psql -U postgres -c "DROP DATABASE repo_vuln;"
+docker exec -it vulnscanner-postgres psql -U postgres -c "CREATE DATABASE repo_vuln;

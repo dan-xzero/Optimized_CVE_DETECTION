@@ -1,92 +1,175 @@
-# 🛡️ CVE Vulnerability Scanner
+# 🛡️ AI-Powered Vulnerability Scanner
 
-A full-stack, automated vulnerability scanner that integrates:
+A comprehensive Python-based vulnerability scanner that analyzes Bitbucket repositories using:
 
-- 🔍 **Syft** & **Grype** for SBOM + vulnerability detection
-- 🧠 **OpenAI** for enrichment, false positive filtering, scoring
-- 📥 **Bitbucket** for repo discovery
-- 🧵 **Slack** for alerts + interactive rescans
-- 🗂️ **NVD Feeds + REST API** for CVE enrichment
-- 🧪 Local **SQLite3** DB for all vuln state
-
----
-
-## 🚀 How It Works
-
-1. **Repo Sync**: Clones all Bitbucket repos
-2. **SBOM Generation**: Uses Syft to detect packages
-3. **Grype Scan**: Finds vulnerabilities via Grype
-4. **OpenAI Enrichment**: Adds severity, summary, false-positive filtering
-5. **NVD Matching**: Downloads NVD feeds + finds CPE matches
-6. **Slack Alerts**: Sends critical vulns to Slack with interactive buttons
-7. **Optional HTML Report**: Renders an HTML dashboard using Jinja2
+- 📦 SBOM Generation via Syft  
+- 🔍 Vulnerability Scanning via Grype  
+- 🤖 Enrichment via OpenAI (GPT)  
+- 🧠 False Positive Detection via AI  
+- 🧾 CVE Enrichment via NVD REST API + Shodan EPSS  
+- 🗃️ PostgreSQL DB (via SQLAlchemy ORM)  
+- 📣 Slack Alerts + Interactive Buttons  
+- 🎟️ Jira Ticket Integration (ADF-formatted)  
+- 🧩 CPE Extraction from Config Files
 
 ---
 
-## ⚙️ Setup
+## ⚙️ Features
 
-1. Install requirements:
+| Feature         | Description                                                              |
+|----------------|--------------------------------------------------------------------------|
+| SBOM            | Generates CycloneDX JSON SBOM via Syft                                  |
+| Grype           | Scans for known vulnerabilities (CVE-based)                             |
+| OpenAI          | GPT-4/3.5-turbo used for CVE enrichment & false-positive validation      |
+| NVD + EPSS      | Real-time CVSS + EPSS scoring from NVD API & Shodan                     |
+| Slack           | Sends alerts + buttons to trigger rescans or Jira ticket creation       |
+| Jira            | Automatically creates rich ADF Jira tickets                             |
+| CPE Extraction  | Uses GPT to identify config-based software and versions                 |
+
+---
+
+## 🧪 How It Works
+
+1. **Repository Fetch** from Bitbucket
+2. **Clone & SBOM** via Syft
+3. **Grype Scan** for CVEs
+4. **OpenAI Enrichment** for severity, mitigation, explanation
+5. **False Positive Check** using GPT
+6. **CPE Extraction** from YAML/JSON files
+7. **Slack Alerts** with actionable buttons
+8. **Jira Ticket** creation for critical vulns
+
+---
+
+## ⚙️ PostgreSQL Setup
+
+This project uses **PostgreSQL** (not SQLite) to enable concurrent, scalable vulnerability scans.
+
+### 🐘 Local PostgreSQL Setup (macOS/Linux)
+
+```bash
+# Install PostgreSQL
+brew install postgresql  # macOS
+sudo apt install postgresql postgresql-contrib  # Ubuntu/Debian
+
+# Start PostgreSQL
+brew services start postgresql  # macOS
+sudo service postgresql start  # Linux
+
+# Create user + DB
+psql postgres
+CREATE USER postgres WITH PASSWORD 'secret';
+CREATE DATABASE repo_vuln OWNER postgres;
+```
+
+Ensure your `.env` contains:
+
+```env
+DATABASE_URL=postgresql://User:Password@localhost:5432/repo_vuln
+```
+
+---
+
+## 🛠️ Setup Instructions
+
+### 1. Clone the Repo
+
+```bash
+git clone https://github.com/your-org/vulnerability-scanner.git
+cd vulnerability-scanner
+```
+
+### 2. Install Dependencies
+
 ```bash
 pip install -r requirements.txt
 ```
 
-2. Create `.env` file:
-```ini
+### 3. Configure `.env`
+
+```env
+# Bitbucket
 BITBUCKET_WORKSPACE=your_workspace
-ATLASSIAN_USERNAME=email@example.com
-ATLASSIAN_API_KEY=xxx
-OPENAI_API_KEY=sk-...
-NVD_API_KEY=...
-SLACK_WEBHOOK_URL=...
+ATLASSIAN_USERNAME=your_email
+ATLASSIAN_API_KEY=your_bitbucket_api_token
+
+# Slack
 SLACK_API_TOKEN=xoxb-...
-SLACK_CHANNEL_ID=CXXXX
-SLACK_SIGNING_SECRET=yyyy
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+SLACK_CHANNEL_ID=C01...
+
+# OpenAI
+OPENAI_API_KEY=sk-...
+
+# Jira
+JIRA_ORG=your-org
+JIRA_USERNAME=your_email
+JIRA_API_KEY=your_jira_token
+
+# Database
+DATABASE_URL=postgresql://postgres:secret@localhost:5432/repo_vuln
+
+# NVD
+NVD_API_KEY=your_nvd_api_key
 ```
 
-3. Install Syft and Grype:
+---
+
+## 🏁 Run the Scanner
+
 ```bash
-brew install syft grype   # or use install scripts from GitHub
+python scanner_postgress.py
 ```
 
----
+Or scan one repo manually:
 
-## 🧪 Run the Scanner
 ```bash
-python3 scanner.py
+python scan_repo_worker.py --repo-name my-repo --clone-url git@bitbucket.org:workspace/my-repo.git --rescan
 ```
 
-## 📲 Start Slack Button Handler
-```bash
-python3 slack_interactivity_server.py
+---
+
+## 📁 Directory Structure
+
 ```
-(Expose with `ngrok http port` and set URL in Slack app settings)
+.
+├── scanner_postgress.py     # Main orchestrator
+├── scan_repo_worker.py      # Single-repo scan worker
+├── models.py                # SQLAlchemy ORM models
+├── db.py                    # DB engine/session creator
+├── file_upload.py           # Slack file uploader
+├── .env                     # Environment secrets
+├── requirements.txt
+├── sboms/                   # Syft SBOMs
+├── repos/                   # Git cloned repos
+├── logs/                    # Per-repo logs
+└── aggregated_vulnerabilities.json
+```
 
 ---
 
-## 📁 Files
-| File                          | Purpose                              |
-|-------------------------------|--------------------------------------|
-| `scanner.py`                 | Main scanning pipeline               |
-| `scan_repo_worker.py`        | Per-repo subprocess scanner          |
-| `slack_interactivity_server.py` | Handles Slack button rescans       |
-| `.env`                       | Your API secrets (not committed)     |
-| `repo_vuln.db`               | SQLite DB                            |
-| `logs/`                      | Individual repo scan logs            |
+## 🧾 Example Slack Alert
+
+```
+:rotating_light: Critical Vulnerability Detected!
+Repo: `my-repo`
+CVE: `CVE-2023-XXXX`
+Severity: Critical (Score: 9.8)
+[ Create Jira Ticket ]
+```
 
 ---
 
-## ✨ Features
-- False-positive detection (OpenAI)
-- Critical alerts + rescans from Slack
-- Auto-downloads + parses NVD feeds
-- HTML dashboard (optional)
-- EPSS score support (optional)
+## ✅ To-Do
+
+- [ ] Frontend React Dashboard
+- [ ] GitHub/GitLab support
+- [ ] ServiceNow ticketing
+- [ ] Full unit/integration tests
 
 ---
 
-> Built for scale: tested on 250+ repos.  
-> Easily extendable to GitHub, GitLab, Jira, ServiceNow.
+## 👨‍💻 Maintainers
 
----
-
-Need help automating with cron/systemd or deploying? Just ask 🙌
+danxzero
+Contributions & feedback welcome!
