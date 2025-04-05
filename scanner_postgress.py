@@ -701,21 +701,16 @@ def process_nvd_feeds():
         results = pool.map(process_single_cve, [(item, cpe_records) for item in items])
 
     # Insert results into DB
+    from sqlalchemy.dialects.postgresql import insert
+
+# Insert results into DB
     with SessionLocal() as session:
         for result in results:
             if not result:
                 continue
             repo_name, cve_id, enriched, false_positive = result
 
-            # Check if vulnerability already exists
-            exists = session.query(NvdVulnerability).filter_by(
-                repository_name=repo_name,
-                vulnerability_id=cve_id
-            ).first()
-            if exists:
-                continue
-
-            vuln = NvdVulnerability(
+            stmt = insert(NvdVulnerability).values(
                 repository_name=repo_name,
                 vulnerability_id=cve_id,
                 actual_severity="NVD",
@@ -728,10 +723,31 @@ def process_nvd_feeds():
                 mitigation=enriched.get("mitigation"),
                 explanation=enriched.get("explanation"),
                 false_positive=false_positive,
-                notified=False
+                notified=False,
+                query_date=datetime.datetime.utcnow()
             )
-            session.add(vuln)
+
+            # On conflict, update relevant fields
+            do_update_stmt = stmt.on_conflict_do_update(
+                index_elements=["repository_name", "vulnerability_id"],
+                set_={
+                    "predicted_severity": stmt.excluded.predicted_severity,
+                    "predicted_score": stmt.excluded.predicted_score,
+                    "epss_score": stmt.excluded.epss_score,
+                    "epss_percentile": stmt.excluded.epss_percentile,
+                    "detailed_description": stmt.excluded.detailed_description,
+                    "vulnerable_package": stmt.excluded.vulnerable_package,
+                    "mitigation": stmt.excluded.mitigation,
+                    "explanation": stmt.excluded.explanation,
+                    "false_positive": stmt.excluded.false_positive,
+                    "notified": stmt.excluded.notified,
+                    "query_date": stmt.excluded.query_date
+                }
+            )
+
+            session.execute(do_update_stmt)
         session.commit()
+
 
     print("✅ NVD feed processing complete.")
 
