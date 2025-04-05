@@ -358,7 +358,7 @@ def chunk_text(text, max_len=2000):
 
 def call_openai_cpe(chunk):
     prompt = f"""
-    Identify any software dependencies in the following config snippet:
+    Identify only valid software dependencies it should be a vilid software only in the following config snippet:
     {chunk}
     Return a JSON array with objects having keys: vendor, product, version.
     """
@@ -378,7 +378,7 @@ def call_openai_cpe(chunk):
         return []
 
 def extract_cpes_from_repo(repo_path):
-    config_exts = (".yml", ".yaml", ".json", ".ini", ".cfg")
+    config_exts = (".yml", ".yaml", ".ini", ".cfg")
     all_results = []
     for root, _, files in os.walk(repo_path):
         for fname in files:
@@ -468,6 +468,7 @@ def process_single_repository(repo, rescan_mode=False):
 
     session = connect_db()  # SQLAlchemy session
     remote_commit = get_remote_head_commit(clone_url)
+    repo_path = None
 
     repo_obj = session.query(Repository).filter_by(name=repo_name).first()
     if repo_obj and repo_obj.last_commit == remote_commit and not rescan_mode:
