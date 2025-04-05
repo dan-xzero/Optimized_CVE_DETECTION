@@ -143,7 +143,7 @@ def send_slack_message(text):
 
 def send_slack_file(filepath, initial_comment=None):
     command = [
-        "python", "file_upload.py",
+        "python3.9", "file_upload.py",
         f'--token="{SLACK_API_TOKEN}"',
         f'--file="{filepath}"',
         f'--channels="{SLACK_CHANNEL_ID}"'
@@ -565,7 +565,7 @@ def process_repositories_parallel():
 
         log_file = open(f"logs/{name}.log", "w")
         cmd = [
-            "python", "scan_repo_worker.py",
+            "python3.9", "scan_repo_worker.py",
             "--repo-name", name,
             "--clone-url", url
         ]
