@@ -13,6 +13,7 @@ import urllib.parse
 import multiprocessing
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
 
 import requests
 from dotenv import load_dotenv
@@ -44,6 +45,7 @@ JIRA_API_KEY = os.getenv("JIRA_API_KEY")
 # Constants
 REPOS_DIR = "repos"
 SBOMS_DIR = "sboms"
+SLACK_RETRY_QUEUE_FILE = "slack_retry_queue.json"
 OPENAI_LOG_FILE = "openai_logs.txt"
 OUTPUT_AGGREGATED_FILE = "aggregated_vulnerabilities.json"
 NVD_CVE_FEED_FOLDER = "nvdcve_feed"
@@ -66,6 +68,23 @@ print(f"[Thread Config] Detected {CPU_COUNT} cores — using {MAX_THREADS} threa
 client = OpenAI(api_key=OPENAI_API_KEY)
 openai_cache = {}
 openai_lock = Lock()
+
+
+
+def queue_failed_slack_message(payload):
+    queue = []
+    if os.path.exists(SLACK_RETRY_QUEUE_FILE):
+        with open(SLACK_RETRY_QUEUE_FILE, "r") as f:
+            try:
+                queue = json.load(f)
+            except json.JSONDecodeError:
+                queue = []
+    queue.append(payload)
+    with open(SLACK_RETRY_QUEUE_FILE, "w") as f:
+        json.dump(queue, f, indent=2)
+
+
+
 
 
 
@@ -137,9 +156,41 @@ def send_jira_button(repo_name, vuln_id, severity):
 def send_slack_message(text):
     payload = {"text": text, "mrkdwn": True}
     try:
-        requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10).raise_for_status()
+        resp = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
+        resp.raise_for_status()
     except requests.RequestException as e:
         print(f"Slack send error: {e}")
+        queue_failed_slack_message(payload)
+
+
+def retry_failed_slack_posts():
+    if not os.path.exists(SLACK_RETRY_QUEUE_FILE):
+        return
+
+    try:
+        with open(SLACK_RETRY_QUEUE_FILE, "r") as f:
+            queue = json.load(f)
+    except json.JSONDecodeError:
+        print("[Retry] Could not parse retry queue.")
+        return
+
+    successful = []
+    for payload in queue:
+        try:
+            resp = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
+            if resp.status_code == 200:
+                successful.append(payload)
+        except Exception as e:
+            print(f"[Retry] Failed again: {e}")
+
+    # Write back remaining failed messages
+    if len(successful) < len(queue):
+        remaining = [p for p in queue if p not in successful]
+        with open(SLACK_RETRY_QUEUE_FILE, "w") as f:
+            json.dump(remaining, f, indent=2)
+    else:
+        os.remove(SLACK_RETRY_QUEUE_FILE)
+
 
 def send_slack_file(filepath, initial_comment=None):
     command = [
@@ -533,7 +584,16 @@ def process_single_repository(repo, rescan_mode=False):
 
                 if rescan_mode and enriched.get("predicted_score", 0) >= 9 and not false_positive:
                     clone_url = clone_url or lookup_clone_url(repo_name)
-                    send_combined_alert(repo_name, vuln_id, enriched.get("predicted_severity"), enriched.get("predicted_score"), clone_url)
+                    send_combined_alert(
+                        repo_name,
+                        vuln_id,
+                        enriched.get("predicted_severity"),
+                        enriched.get("predicted_score"),
+                        clone_url,
+                        enriched.get("vulnerable_package"),
+                        enriched.get("detailed_description"),
+                        enriched.get("mitigation")
+                    )
 
         session.commit()
 
@@ -544,7 +604,6 @@ def process_single_repository(repo, rescan_mode=False):
         session.close()
         if os.path.exists(repo_path):
             shutil.rmtree(repo_path)
-
 
 
 
@@ -812,32 +871,69 @@ def query_nvd_rest_api(cve_id, max_retries=3, delay=2):
 # scanner.py — All-in-One Vulnerability Scanner (Final Part)
 # Adds: Vulnerability aggregation, Slack upload, critical alert, and main entrypoint
 
-def send_combined_alert(repo, cve_id, severity, score, clone_url):
+MAX_RETRIES = 5
+RETRY_DELAY = 2  # seconds
+FAILED_LOG = "failed_slack_retries.log"
+
+def send_combined_alert(repo, cve_id, severity, score, clone_url, pkg=None, explanation=None, mitigation=None, thread_ts=None):
+    from slack_sdk.errors import SlackApiError
+    from slack_sdk import WebClient
+    import time
+
     client = WebClient(token=SLACK_API_TOKEN)
-    client.chat_postMessage(
-        channel=SLACK_CHANNEL_ID,
-        blocks=[
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f":rotating_light: *Critical Vulnerability Detected!*\n*Repo:* `{repo}`\n*CVE:* `{cve_id}`\n*Severity:* {severity} (Score: {score})"
-                }
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Create Jira Ticket"},
-                        "value": f"{repo}|{cve_id}|{severity}",
-                        "action_id": "create_jira_ticket"
-                    }
-                ]
+
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*CVE:* `{cve_id}` — *{severity}* (Score: {score})\n"
+                    f"📦 *Package:* `{pkg or 'unknown'}`\n"
+                    f"🔍 *Details:* {explanation or '_No explanation available_'}\n"
+                    f"🛡️ *Mitigation:* {mitigation or '_None provided_'}"
+                )
             }
-        ],
-        text=f"Critical vulnerability in {repo}"
-    )
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Create Jira Ticket"},
+                    "value": f"{repo}|{cve_id}|{severity}",
+                    "action_id": "create_jira_ticket"
+                }
+            ]
+        }
+    ]
+
+    retry = 0
+    while retry < 5:
+        try:
+            response = client.chat_postMessage(
+                channel=SLACK_CHANNEL_ID,
+                text=f"{severity} vulnerability in {repo}: {cve_id}",
+                blocks=blocks,
+                thread_ts=thread_ts
+            )
+            return response
+        except SlackApiError as e:
+            print(f"[Slack Retry {retry+1}] Failed to post message: {e.response['error']}")
+            retry += 1
+            time.sleep(2 * retry)
+        except Exception as ex:
+            print(f"[Slack Retry {retry+1}] General error: {ex}")
+            retry += 1
+            time.sleep(2 * retry)
+
+    # Fallback: store failed message locally
+    failed_dir = "failed_slack_msgs"
+    os.makedirs(failed_dir, exist_ok=True)
+    fallback_path = os.path.join(failed_dir, f"{repo}_{cve_id}.json")
+    with open(fallback_path, "w") as f:
+        json.dump({"repo": repo, "cve_id": cve_id, "severity": severity, "score": score, "pkg": pkg, "explanation": explanation, "mitigation": mitigation}, f, indent=2)
+    print(f"[Slack Fallback] Message saved to {fallback_path}")
 
 # Aggregate vulnerabilities
 
@@ -1015,28 +1111,95 @@ def lookup_clone_url(repo_name):
         session.close()
 
 def send_critical_vuln_alerts(vulns):
+
     session = connect_db()
 
     criticals = session.query(GrypeVulnerability).filter(
-        GrypeVulnerability.predicted_score >= 9,
+        GrypeVulnerability.predicted_score >= 7,
         GrypeVulnerability.false_positive == False,
         GrypeVulnerability.notified == False
     ).all()
 
     if not criticals:
-        send_slack_message(":white_check_mark: No new critical vulnerabilities found.")
+        send_slack_message(":white_check_mark: No new high/critical vulnerabilities found.")
         session.close()
         return
 
-    for vuln in criticals:
-        clone_url = lookup_clone_url(vuln.repository_name)
-        send_combined_alert(vuln.repository_name, vuln.vulnerability_id, vuln.predicted_severity, vuln.predicted_score, clone_url)
+    # Group by repo
+    repo_map = defaultdict(list)
+    for v in criticals:
+        repo_map[v.repository_name].append(v)
 
-        # Mark as notified
-        vuln.notified = True
+    client = WebClient(token=SLACK_API_TOKEN)
+
+    for repo, vulns in repo_map.items():
+        crit = sum(1 for v in vulns if v.predicted_score >= 9)
+        high = sum(1 for v in vulns if 7 <= v.predicted_score < 9)
+        med = sum(1 for v in vulns if 4 <= v.predicted_score < 7)
+
+        summary_text = (
+            f"🔐 *Scan Summary for `{repo}`*\n"
+            f"✅ *{crit} Critical* | ⚠️ *{high} High* | 🔍 *{med} Medium*\n"
+            f"🧵 Vulnerability details in thread."
+        )
+
+        try:
+            summary_response = client.chat_postMessage(
+                channel=SLACK_CHANNEL_ID,
+                text=summary_text
+            )
+            thread_ts = summary_response["ts"]
+        except SlackApiError as e:
+            print(f"[Slack Summary Error] {e}")
+            # Persist the summary failure to retry later
+            os.makedirs("failed_slack_msgs", exist_ok=True)
+            with open(f"failed_slack_msgs/summary_{repo}.json", "w") as f:
+                json.dump({"repo": repo, "text": summary_text}, f)
+            continue
+
+        for vuln in vulns:
+            for attempt in range(5):
+                try:
+                    ts = send_combined_alert(
+                        repo,
+                        vuln.vulnerability_id,
+                        vuln.predicted_severity,
+                        vuln.predicted_score,
+                        lookup_clone_url(repo),
+                        vuln.vulnerable_package,
+                        vuln.detailed_description,
+                        vuln.mitigation,
+                        thread_ts=thread_ts
+                    )
+                    if ts:
+                        vuln.notified = True
+                    break
+                except SlackApiError as e:
+                    print(f"[Retry {attempt+1}] Slack post failed: {e}")
+                    time.sleep(2 * (attempt + 1))
+                    if attempt == 4:
+                        os.makedirs("failed_slack_msgs", exist_ok=True)
+                        path = f"failed_slack_msgs/{repo}_{vuln.vulnerability_id}.json"
+                        with open(path, "w") as f:
+                            json.dump({
+                                "repo": repo,
+                                "vuln_id": vuln.vulnerability_id,
+                                "severity": vuln.predicted_severity,
+                                "score": vuln.predicted_score,
+                                "clone_url": lookup_clone_url(repo),
+                                "package": vuln.vulnerable_package,
+                                "explanation": vuln.detailed_description,
+                                "mitigation": vuln.mitigation,
+                                "thread_ts": thread_ts
+                            }, f)
 
     session.commit()
     session.close()
+
+    # ✅ Retry any failed Slack messages
+    retry_failed_slack_posts()
+
+
 
 # Final Entry Point
 
