@@ -14,6 +14,7 @@ import multiprocessing
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
+import threading
 
 import requests
 from dotenv import load_dotenv
@@ -27,6 +28,8 @@ from sqlalchemy.exc import OperationalError, IntegrityError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from db import SessionLocal, engine
 from models import Base, Repository, GrypeVulnerability, NvdVulnerability, RepositoryCpe
+
+import logging
 
 
 # Load environment variables
@@ -71,84 +74,107 @@ openai_lock = Lock()
 
 
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("scanner.log"),
+        logging.StreamHandler()
+    ]
+)
+
+
+slack_queue_lock = threading.Lock()
+
 def queue_failed_slack_message(payload):
-    queue = []
-    if os.path.exists(SLACK_RETRY_QUEUE_FILE):
-        with open(SLACK_RETRY_QUEUE_FILE, "r") as f:
-            try:
-                queue = json.load(f)
-            except json.JSONDecodeError:
-                queue = []
-    queue.append(payload)
-    with open(SLACK_RETRY_QUEUE_FILE, "w") as f:
-        json.dump(queue, f, indent=2)
+    try:
+        with slack_queue_lock:
+            queue = []
+            if os.path.exists(SLACK_RETRY_QUEUE_FILE):
+                with open(SLACK_RETRY_QUEUE_FILE, "r") as f:
+                    try:
+                        queue = json.load(f)
+                    except json.JSONDecodeError:
+                        logging.warning("[Slack Queue] Malformed JSON, resetting queue.")
+                        queue = []
 
-
-
-
+            queue.append(payload)
+            with open(SLACK_RETRY_QUEUE_FILE, "w") as f:
+                json.dump(queue, f, indent=2)
+        logging.info("[Slack Queue] Message queued for retry.")
+    except Exception as e:
+        logging.error(f"[Slack Queue Error] {e}")
 
 
 def send_slack_rescan_button(repo_name, clone_url):
+    payload = {
+        "channel": SLACK_CHANNEL_ID,
+        "blocks": [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"🔁 *Rescan {repo_name}?*"}
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Rescan Repo"},
+                        "value": f"{repo_name}|{clone_url}",
+                        "action_id": "rescan_repo"
+                    }
+                ]
+            }
+        ],
+        "text": f"Rescan requested for {repo_name}"
+    }
+
     try:
         client = WebClient(token=SLACK_API_TOKEN)
-        response = client.chat_postMessage(
-            channel=SLACK_CHANNEL_ID,
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"🔁 *Rescan {repo_name}?*"
-                    }
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Rescan Repo"},
-                            "value": f"{repo_name}|{clone_url}",
-                            "action_id": "rescan_repo"
-                        }
-                    ]
-                }
-            ],
-            text=f"Rescan requested for {repo_name}"
-        )
-        print(f"[Slack] Rescan button sent for {repo_name}")
+        client.chat_postMessage(**payload)
+        logging.info(f"[Slack] Rescan button sent for {repo_name}")
     except SlackApiError as e:
-        print(f"[Slack Error] {e.response['error']}")
+        logging.error(f"[Slack Error] Rescan button failed: {e.response['error']}")
+        queue_failed_slack_message(payload)
+    except Exception as e:
+        logging.error(f"[Slack Error] Unexpected error sending rescan button: {e}")
+        queue_failed_slack_message(payload)
+
 
 def send_jira_button(repo_name, vuln_id, severity):
+    payload = {
+        "channel": SLACK_CHANNEL_ID,
+        "blocks": [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Jira ticket for `{vuln_id}` in `{repo_name}`?*"}
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Create Jira Ticket"},
+                        "value": f"{repo_name}|{vuln_id}|{severity}",
+                        "action_id": "create_jira_ticket"
+                    }
+                ]
+            }
+        ],
+        "text": f"Jira ticket option for {vuln_id}"
+    }
+
     try:
         client = WebClient(token=SLACK_API_TOKEN)
-        response = client.chat_postMessage(
-            channel=SLACK_CHANNEL_ID,
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Jira ticket for `{vuln_id}` in `{repo_name}`?*"
-                    }
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Create Jira Ticket"},
-                            "value": f"{repo_name}|{vuln_id}|{severity}",
-                            "action_id": "create_jira_ticket"
-                        }
-                    ]
-                }
-            ],
-            text=f"Jira ticket option for {vuln_id}"
-        )
-        print(f"[Slack] Jira button sent for {repo_name}/{vuln_id}")
+        client.chat_postMessage(**payload)
+        logging.info(f"[Slack] Jira button sent for {repo_name}/{vuln_id}")
     except SlackApiError as e:
-        print(f"[Slack Error] {e.response['error']}")
+        logging.error(f"[Slack Error] Jira button failed: {e.response['error']}")
+        queue_failed_slack_message(payload)
+    except Exception as e:
+        logging.error(f"[Slack Error] Unexpected error sending Jira button: {e}")
+        queue_failed_slack_message(payload)
+
 
 
 # Slack Notification Functions
@@ -1135,11 +1161,10 @@ def send_critical_vuln_alerts(vulns):
     for repo, vulns in repo_map.items():
         crit = sum(1 for v in vulns if v.predicted_score >= 9)
         high = sum(1 for v in vulns if 7 <= v.predicted_score < 9)
-        med = sum(1 for v in vulns if 4 <= v.predicted_score < 7)
 
         summary_text = (
             f"🔐 *Scan Summary for `{repo}`*\n"
-            f"✅ *{crit} Critical* | ⚠️ *{high} High* | 🔍 *{med} Medium*\n"
+            f":rotating_light:  *{crit} Critical* | ⚠️ *{high} High* \n"
             f"🧵 Vulnerability details in thread."
         )
 
